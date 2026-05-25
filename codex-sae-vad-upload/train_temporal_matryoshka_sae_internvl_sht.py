@@ -189,15 +189,36 @@ def _resolve_path(path, root):
     return Path(root).resolve() / path
 
 
+def _video_path_relative_to_dataset(value, dataset_root):
+    """Map JSON video paths onto the caller-provided dataset_root.
+
+    Old dataset JSONs may contain machine-specific absolute paths such as
+    /root/autodl-tmp/sht_clip_32_160/train_normal/foo.mp4. For portable runs,
+    only the path below the dataset directory should be used.
+    """
+    path = Path(value)
+    if not path.is_absolute():
+        return path
+
+    parts = path.parts
+    dataset_name = Path(dataset_root).name
+    anchors = [dataset_name, "sht_clip_32_160"]
+    for anchor in anchors:
+        if anchor in parts:
+            idx = parts.index(anchor)
+            return Path(*parts[idx + 1 :])
+    return Path(path.name)
+
+
 def _resolve_row_video_paths(rows, dataset_root):
     dataset_root = Path(dataset_root).resolve()
     out = []
     for row in rows:
         row = dict(row)
-        for key in ("video", "source_video"):
+        for key in ("video",):
             value = row.get(key)
-            if value and not Path(value).is_absolute():
-                row[key] = str(dataset_root / value)
+            if value:
+                row[key] = str(dataset_root / _video_path_relative_to_dataset(value, dataset_root))
         out.append(row)
     return out
 
