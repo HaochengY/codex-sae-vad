@@ -233,7 +233,7 @@ def build_arg_parser():
     parser.add_argument("--hook-layer", type=int, default=12)
     parser.add_argument("--num-frames", type=int, default=8)
     parser.add_argument("--max-patches-per-frame", type=int, default=1)
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--max-samples", type=int, default=0)
     parser.add_argument("--num-latents", type=int, default=0)
     parser.add_argument("--expansion-factor", type=int, default=16)
@@ -244,7 +244,7 @@ def build_arg_parser():
     parser.add_argument("--alpha-mat", type=float, default=0.1)
     parser.add_argument("--high-frac", type=float, default=0.2)
     parser.add_argument("--log-every", type=int, default=5)
-    parser.add_argument("--save-every", type=int, default=100)
+    parser.add_argument("--save-every", type=int, default=3000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16")
     return parser
