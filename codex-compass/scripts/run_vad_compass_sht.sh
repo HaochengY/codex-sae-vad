@@ -3,6 +3,10 @@ set -euo pipefail
 
 PYTHON_BIN="${PYTHON_BIN:-/root/miniconda3/envs/mllm/bin/python}"
 PROJECT_ROOT="${PROJECT_ROOT:-/root/codex/codex-compass}"
+FREEZE_INTERNVL_ARGS=()
+if [[ "${FREEZE_INTERNVL:-0}" == "1" ]]; then
+  FREEZE_INTERNVL_ARGS+=(--freeze-internvl)
+fi
 
 "${PYTHON_BIN}" "${PROJECT_ROOT}/scripts/train_vad_compass_internvl2_sht.py" \
   --project-root "${PROJECT_ROOT}" \
@@ -21,9 +25,13 @@ PROJECT_ROOT="${PROJECT_ROOT:-/root/codex/codex-compass}"
   --slot-dim "${SLOT_DIM:-512}" \
   --slot-heads "${SLOT_HEADS:-8}" \
   --slot-layers "${SLOT_LAYERS:-2}" \
-  --rollout-n "${ROLLOUT_N:-4}" \
+  --rollout-n "${ROLLOUT_N:-8}" \
+  --max-new-tokens "${MAX_NEW_TOKENS:-512}" \
+  --temperature "${TEMPERATURE:-1.0}" \
+  --top-p "${TOP_P:-1.0}" \
   --lambda-grpo "${LAMBDA_GRPO:-1.0}" \
   --lambda-bce "${LAMBDA_BCE:-1.0}" \
   --lambda-recon "${LAMBDA_RECON:-0.05}" \
   --dtype "${DTYPE:-bfloat16}" \
+  "${FREEZE_INTERNVL_ARGS[@]}" \
   "$@"

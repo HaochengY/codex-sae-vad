@@ -14,14 +14,17 @@ from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from vad_compass.internvl_utils import build_internvl, extract_compass_hidden, resolve_hook_module
+from vad_compass.internvl_utils import (
+    build_internvl,
+    extract_compass_hidden,
+    load_video_as_pixel_values,
+    resolve_hook_module,
+)
 from vad_compass.modeling import VadCompassHead
 from vad_compass.path_utils import load_json_rows, portable_rows, resolve_path
 from vad_compass.reward import (
-    bernoulli_grpo_loss,
+    format_score,
     grpo_advantages,
-    synthetic_response,
-    vad_reward,
     video_bce_loss,
 )
 
@@ -88,6 +91,81 @@ def append_jsonl(path, record):
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
+def reference_response(label, pos_token="<RULE>", k_slots=4):
+    evidence = (
+        "The clip contains behavior that appears to violate the listed rules."
+        if int(label) == 1
+        else "The clip does not show clear behavior that violates the listed rules."
+    )
+    pos_tokens = " ".join([pos_token] * int(k_slots))
+    return f"<think> {evidence} </think>\nViolated rules:{pos_tokens}"
+
+
+def response_for_forward(response, pos_token="<RULE>", k_slots=4):
+    missing = int(k_slots) - response.count(pos_token)
+    if missing <= 0:
+        return response
+    separator = " " if response and not response.endswith((" ", "\n")) else ""
+    return response + separator + " ".join([pos_token] * missing)
+
+
+def vad_response_reward(label, response, video_prob, format_weight=0.3, task_weight=0.7, pos_token="<RULE>", k_slots=4):
+    fs = format_score(response, pos_token=pos_token, k_slots=k_slots)
+    prob = float(video_prob)
+    task_score = prob if int(label) == 1 else 1.0 - prob
+    return format_weight * fs + task_weight * task_score, fs, task_score
+
+
+@torch.no_grad()
+def generate_rollout_responses(row, model, tokenizer, dtype, question, args):
+    pixel_values, num_patches_list = load_video_as_pixel_values(
+        row["video"],
+        num_frames=args.num_frames,
+        input_size=args.input_size,
+        max_num=args.max_patches_per_frame,
+    )
+    pixel_values = pixel_values.to(dtype=dtype, device="cuda")
+    image_prefix = "\n".join(["<image>"] * len(num_patches_list))
+    rollout_question = f"{image_prefix}\n{question.strip()}"
+    generation_config = {
+        "max_new_tokens": args.max_new_tokens,
+        "do_sample": True,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+    }
+    was_training = model.training
+    model.eval()
+    responses = []
+    for _ in range(args.rollout_n):
+        response = model.chat(
+            tokenizer,
+            pixel_values,
+            rollout_question,
+            generation_config.copy(),
+            num_patches_list=num_patches_list,
+        )
+        responses.append(response.strip())
+    if was_training:
+        model.train()
+    return responses
+
+
+def response_log_prob(compass, tokenizer, response):
+    output = compass["model_output"]
+    if not hasattr(output, "logits"):
+        raise ValueError("model output does not expose logits for GRPO policy loss")
+    response_ids = tokenizer(response, add_special_tokens=False)["input_ids"]
+    if not response_ids:
+        return output.logits.sum() * 0.0
+    logits = output.logits[0, :-1].float()
+    targets = compass["input_ids"][1:].to(logits.device)
+    log_probs = torch.log_softmax(logits, dim=-1).gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+    n = min(len(response_ids), max(1, log_probs.numel() - 1))
+    if log_probs.numel() > n:
+        return log_probs[-(n + 1) : -1].sum()
+    return log_probs[-n:].sum()
+
+
 def build_arg_parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--project-root", default=".")
@@ -113,8 +191,11 @@ def build_arg_parser():
     parser.add_argument("--slot-dim", type=int, default=512)
     parser.add_argument("--slot-heads", type=int, default=8)
     parser.add_argument("--slot-layers", type=int, default=2)
-    parser.add_argument("--rollout-n", type=int, default=4)
-    parser.add_argument("--sample-actions", action="store_true")
+    parser.add_argument("--rollout-n", type=int, default=8)
+    parser.add_argument("--max-new-tokens", type=int, default=512)
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--top-p", type=float, default=1.0)
+    parser.add_argument("--freeze-internvl", action="store_true")
     parser.add_argument("--lr", type=float, default=1.6e-6)
     parser.add_argument("--lr-qb-rate", type=float, default=30.0)
     parser.add_argument("--lr-head-rate", type=float, default=25.0)
@@ -135,6 +216,7 @@ def build_arg_parser():
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--save-every", type=int, default=100)
     parser.add_argument("--tensorboard-logdir", default="")
+    parser.add_argument("--debug-rollouts", action="store_true")
     parser.add_argument("--smoke", action="store_true")
     return parser
 
@@ -163,7 +245,6 @@ def train(args):
     if args.smoke:
         args.epochs = 1
         args.max_steps = min(args.max_steps or 2, 2)
-        args.rollout_n = min(args.rollout_n, 2)
 
     model, tokenizer, dtype, special_token_ids = build_internvl(
         model_path,
@@ -171,6 +252,12 @@ def train(args):
         special_tokens=[args.pos_token],
         train_special_tokens=args.train_rule_embedding,
     )
+    if args.freeze_internvl:
+        model.eval()
+    else:
+        for p in model.parameters():
+            p.requires_grad_(True)
+        model.train()
     pos_token_id = special_token_ids[args.pos_token]
     hook_name, hook_module = resolve_hook_module(model, args.hook_layer)
     _, final_hook_module = resolve_hook_module(model, model.config.llm_config.num_hidden_layers - 1)
@@ -220,7 +307,6 @@ def train(args):
     if not args.train_sae:
         for p in vad.sae.parameters():
             p.requires_grad_(False)
-    emb_params = [p for p in model.language_model.get_input_embeddings().parameters() if p.requires_grad]
     param_groups = []
 
     def add_group(name, params, lr):
@@ -230,9 +316,10 @@ def train(args):
 
     add_group("query_book", vad.query_book.parameters(), args.lr * args.lr_qb_rate)
     add_group("head", list(vad.query_fuse.parameters()) + list(vad.conf_head.parameters()), args.lr * args.lr_head_rate)
-    add_group("pe", list(vad.pos_proj.parameters()) + emb_params, args.lr * args.lr_pe_rate)
+    add_group("pe", vad.pos_proj.parameters(), args.lr * args.lr_pe_rate)
     if args.train_sae:
         add_group("sae", vad.sae.parameters(), args.lr * args.lr_decoder_rate)
+    add_group("internvl", model.parameters(), args.lr)
     opt = torch.optim.AdamW(param_groups, lr=args.lr, weight_decay=args.weight_decay)
     metrics_path = output_dir / "metrics.jsonl"
     errors_path = output_dir / "errors.jsonl"
@@ -264,8 +351,9 @@ def train(args):
             ],
             "pos_token": args.pos_token,
             "pos_token_id": pos_token_id,
+            "internvl_trainable": not args.freeze_internvl,
             "label_counts": dict(label_counts),
-            "loss": "lambda_grpo*GRPO(format+task reward) + lambda_bce*BCE(video_prob,label); SAE_MSE is added only when --train-sae is set",
+            "loss": "lambda_grpo*GRPO(generated response reward) + lambda_bce*BCE(video_prob,label); SAE_MSE is added only when --train-sae is set",
             "tensorboard_logdir": str(resolve_path(args.tensorboard_logdir, project_root)) if args.tensorboard_logdir else "",
             "path_policy": "All CLI paths are resolved relative to --project-root unless absolute. JSON media paths are converted to paths relative to --dataset-root.",
         }
@@ -288,13 +376,7 @@ def train(args):
                     POS_TOKEN=args.pos_token,
                     POS_TOKENS=" ".join([args.pos_token] * args.k_slots),
                 )
-                gold_response = synthetic_response(
-                    int(label.item()),
-                    int(label.item()),
-                    0.5,
-                    pos_token=args.pos_token,
-                    k_slots=args.k_slots,
-                )
+                gold_response = reference_response(int(label.item()), pos_token=args.pos_token, k_slots=args.k_slots)
                 compass = extract_compass_hidden(
                     row,
                     model,
@@ -309,30 +391,17 @@ def train(args):
                 )
                 out = vad(compass["sae_tokens"], compass["pos_hidden"])
                 video_prob = out["video_prob"]
+                prob_value = float(video_prob.detach().item())
                 bce_loss = video_bce_loss(video_prob, label)
                 recon_loss = out["recon_loss"]
 
-                if args.sample_actions:
-                    logit = torch.logit(video_prob.clamp(1e-6, 1.0 - 1e-6)).detach()
-                    dist = torch.distributions.Bernoulli(logits=logit.repeat(args.rollout_n))
-                    actions = dist.sample()
-                    old_log_probs = dist.log_prob(actions).detach()
-                else:
-                    base_actions = torch.tensor([0.0, 1.0], device="cuda")
-                    repeats = (args.rollout_n + 1) // 2
-                    actions = base_actions.repeat(repeats)[: args.rollout_n]
                 rewards, format_scores, task_scores = [], [], []
                 candidate_log_probs = []
                 old_log_probs = []
-                prob_value = float(video_prob.detach().item())
-                for action in actions.detach().cpu().tolist():
-                    response = synthetic_response(
-                        int(label.item()),
-                        int(action),
-                        prob_value,
-                        pos_token=args.pos_token,
-                        k_slots=args.k_slots,
-                    )
+                rollout_debug = []
+                rollout_responses = generate_rollout_responses(row, model, tokenizer, dtype, question, args)
+                for rollout_idx, response in enumerate(rollout_responses):
+                    forward_response = response_for_forward(response, pos_token=args.pos_token, k_slots=args.k_slots)
                     cand = extract_compass_hidden(
                         row,
                         model,
@@ -341,21 +410,18 @@ def train(args):
                         hook_module,
                         final_hook_module,
                         question,
-                        response,
+                        forward_response,
                         pos_token_id,
                         args,
                     )
                     cand_out = vad(cand["sae_tokens"], cand["pos_hidden"])
-                    cand_logit = torch.logit(cand_out["video_prob"].clamp(1e-6, 1.0 - 1e-6)).view(())
-                    cand_dist = torch.distributions.Bernoulli(logits=cand_logit)
-                    act_t = torch.tensor(float(action), device="cuda")
-                    lp = cand_dist.log_prob(act_t)
+                    lp = response_log_prob(cand, tokenizer, response)
                     candidate_log_probs.append(lp)
                     old_log_probs.append(lp.detach())
-                    reward, fs, ts = vad_reward(
+                    reward, fs, ts = vad_response_reward(
                         int(label.item()),
-                        int(action),
                         response,
+                        float(cand_out["video_prob"].detach().item()),
                         format_weight=args.format_weight,
                         task_weight=args.task_weight,
                         pos_token=args.pos_token,
@@ -364,6 +430,17 @@ def train(args):
                     rewards.append(reward)
                     format_scores.append(fs)
                     task_scores.append(ts)
+                    rollout_debug.append(
+                        {
+                            "idx": rollout_idx,
+                            "response": response,
+                            "format_score": float(fs),
+                            "task_score": float(ts),
+                            "reward": float(reward),
+                            "video_prob": float(cand_out["video_prob"].detach().item()),
+                            "log_prob": float(lp.detach().cpu()),
+                        }
+                    )
 
                 rewards_t = torch.tensor(rewards, device="cuda", dtype=torch.float32)
                 advantages = grpo_advantages(rewards_t, args.rollout_n)
@@ -410,8 +487,17 @@ def train(args):
                     "approx_kl": float(approx_kl.detach().cpu()),
                     "clipfrac": float(clipfrac.detach().cpu()),
                     "slot_probs": [float(x) for x in out["slot_probs"][0].detach().cpu().tolist()],
+                    "rollout_n": len(rollout_responses),
+                    "sample_responses": rollout_responses[:2],
                     "elapsed_sec": round(time.time() - start, 2),
                 }
+                if rollout_debug:
+                    best_rollout = max(rollout_debug, key=lambda item: item["reward"])
+                    rec["best_rollout_idx"] = best_rollout["idx"]
+                    rec["best_rollout_reward"] = best_rollout["reward"]
+                    rec["best_rollout_response"] = best_rollout["response"]
+                    if args.debug_rollouts:
+                        rec["rollouts"] = rollout_debug
                 if global_step % args.log_every == 0:
                     append_jsonl(metrics_path, rec)
                     if tb_writer is not None:
@@ -468,7 +554,14 @@ def train(args):
         },
         final_path,
     )
-    print(json.dumps({"final": str(final_path), "steps": global_step}, ensure_ascii=False, indent=2))
+    internvl_final = ""
+    if not args.freeze_internvl:
+        internvl_dir = output_dir / "internvl_final"
+        internvl_dir.mkdir(parents=True, exist_ok=True)
+        model.save_pretrained(str(internvl_dir))
+        tokenizer.save_pretrained(str(internvl_dir))
+        internvl_final = str(internvl_dir)
+    print(json.dumps({"final": str(final_path), "internvl_final": internvl_final, "steps": global_step}, ensure_ascii=False, indent=2))
     if tb_writer is not None:
         tb_writer.close()
     return final_path

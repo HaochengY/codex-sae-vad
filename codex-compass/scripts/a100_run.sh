@@ -2,48 +2,36 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="${PROJECT_ROOT:-$(cd "${SCRIPT_DIR}/.." && pwd)}"
+PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_ROOT}"
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 
-# Dataset layout expected under DATASET_ROOT:
-#   clips/train/*.mp4
-#   clips/test/*.mp4
-#   frame_labels/train/*.npy
-#   frame_labels/test/*.npy
-DATASET_ROOT="${DATASET_ROOT:-data/window3s_step1s_dataset}"
+DATASET_ROOT="${DATASET_ROOT:-/mnt/petrelfs/wangxiaoyang/yhc/dataset/sht/window3s_step1s_dataset}"
 CLIPS_SUBDIRS="${CLIPS_SUBDIRS:-clips/train,clips/test}"
 LABELS_SUBDIRS="${LABELS_SUBDIRS:-frame_labels/train,frame_labels/test}"
 
-# Model directory. Keep this relative or pass MODEL_PATH from the shell.
-MODEL_PATH="${MODEL_PATH:-models/InternVL2}"
+MODEL_PATH="${MODEL_PATH:-/mnt/petrelfs/wangxiaoyang/yhc/get_data/InternVL2}"
+OUTPUT_DIR="${OUTPUT_DIR:-outputs/a100_run}"
+TRAIN_JSON="${TRAIN_JSON:-outputs/a100_run/train_index.json}"
+TENSORBOARD_LOGDIR="${TENSORBOARD_LOGDIR:-outputs/tensorboard/a100_run}"
 
-# Smoke data and outputs.
-OUTPUT_DIR="${OUTPUT_DIR:-outputs/sht_window_smoke}"
-SMOKE_JSON="${SMOKE_JSON:-outputs/sht_window_smoke/smoke_train.json}"
-TENSORBOARD_LOGDIR="${TENSORBOARD_LOGDIR:-outputs/tensorboard/sht_window_smoke}"
-SMOKE_SAMPLES="${SMOKE_SAMPLES:-4}"
+MAX_SAMPLES="${MAX_SAMPLES:-0}"
+MAX_STEPS="${MAX_STEPS:-0}"
+EPOCHS="${EPOCHS:-5}"
 SEED="${SEED:-42}"
-
-# Training controls. Increase EPOCHS for repeated passes over the smoke set.
-EPOCHS="${EPOCHS:-1}"
-MAX_STEPS="${MAX_STEPS:-2}"
 LOG_EVERY="${LOG_EVERY:-1}"
 SAVE_EVERY="${SAVE_EVERY:-100}"
 
-# Video/model controls.
-NUM_FRAMES="${NUM_FRAMES:-4}"
+NUM_FRAMES="${NUM_FRAMES:-12}"
 INPUT_SIZE="${INPUT_SIZE:-448}"
 MAX_PATCHES_PER_FRAME="${MAX_PATCHES_PER_FRAME:-1}"
 HOOK_LAYER="${HOOK_LAYER:-12}"
+SAE_PATH="${SAE_PATH:-/mnt/petrelfs/wangxiaoyang/yhc/codex-sae-vad/outputs/sae_l${HOOK_LAYER}/sae_final.pt}"
 DTYPE="${DTYPE:-bfloat16}"
 
-# VAD-Compass controls.
 K_SLOTS="${K_SLOTS:-4}"
 POS_TOKEN="${POS_TOKEN:-<RULE>}"
-SAE_ROOT="${SAE_ROOT:-/root/codex/outputs/temporal_m_sae_internvl_sht_clips10k_filtered_8f_16x_k256_1ep}"
-SAE_PATH="${SAE_PATH:-${SAE_ROOT}/sae_final.pt}"
 EXPANSION_FACTOR="${EXPANSION_FACTOR:-16}"
 NUM_LATENTS="${NUM_LATENTS:-0}"
 SAE_TOPK="${SAE_TOPK:-0}"
@@ -51,7 +39,11 @@ SLOT_DIM="${SLOT_DIM:-512}"
 SLOT_HEADS="${SLOT_HEADS:-8}"
 SLOT_LAYERS="${SLOT_LAYERS:-2}"
 
-# Optimization and reward controls.
+ROLLOUT_N="${ROLLOUT_N:-8}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
+TEMPERATURE="${TEMPERATURE:-1.0}"
+TOP_P="${TOP_P:-1.0}"
+
 LR="${LR:-1.6e-6}"
 LR_QB_RATE="${LR_QB_RATE:-30}"
 LR_HEAD_RATE="${LR_HEAD_RATE:-25}"
@@ -59,49 +51,57 @@ LR_PE_RATE="${LR_PE_RATE:-10}"
 LR_DECODER_RATE="${LR_DECODER_RATE:-5}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-2}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
-TRAIN_SAE="${TRAIN_SAE:-0}"
-TRAIN_RULE_EMBEDDING="${TRAIN_RULE_EMBEDDING:-0}"
-ROLLOUT_N="${ROLLOUT_N:-8}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
-TEMPERATURE="${TEMPERATURE:-1.0}"
-TOP_P="${TOP_P:-1.0}"
-FREEZE_INTERNVL="${FREEZE_INTERNVL:-0}"
+
 LAMBDA_GRPO="${LAMBDA_GRPO:-1.0}"
 LAMBDA_BCE="${LAMBDA_BCE:-1.0}"
 LAMBDA_RECON="${LAMBDA_RECON:-0.05}"
 FORMAT_WEIGHT="${FORMAT_WEIGHT:-0.3}"
 TASK_WEIGHT="${TASK_WEIGHT:-0.7}"
 CLIPRANGE="${CLIPRANGE:-0.2}"
-TRAIN_SAE_ARGS=()
-if [ "${TRAIN_SAE}" = "1" ]; then
-  TRAIN_SAE_ARGS+=(--train-sae)
-fi
-TRAIN_RULE_EMBEDDING_ARGS=()
-if [ "${TRAIN_RULE_EMBEDDING}" = "1" ]; then
-  TRAIN_RULE_EMBEDDING_ARGS+=(--train-rule-embedding)
-fi
-FREEZE_INTERNVL_ARGS=()
-if [ "${FREEZE_INTERNVL}" = "1" ]; then
-  FREEZE_INTERNVL_ARGS+=(--freeze-internvl)
-fi
+
+TRAIN_SAE="${TRAIN_SAE:-0}"
+TRAIN_RULE_EMBEDDING="${TRAIN_RULE_EMBEDDING:-0}"
+FREEZE_INTERNVL="${FREEZE_INTERNVL:-0}"
+DEBUG_ROLLOUTS="${DEBUG_ROLLOUTS:-0}"
+
+mkdir -p "$(dirname "${TRAIN_JSON}")" "${OUTPUT_DIR}" "${TENSORBOARD_LOGDIR}"
 
 "${PYTHON_BIN}" "scripts/prepare_sht_window_smoke_json.py" \
   --dataset-root "${DATASET_ROOT}" \
   --clips-subdirs "${CLIPS_SUBDIRS}" \
   --labels-subdirs "${LABELS_SUBDIRS}" \
-  --output-json "${SMOKE_JSON}" \
-  --max-samples "${SMOKE_SAMPLES}" \
+  --output-json "${TRAIN_JSON}" \
+  --max-samples "${MAX_SAMPLES}" \
   --seed "${SEED}"
+
+if [ ! -s "${TRAIN_JSON}" ]; then
+  echo "ERROR: failed to create non-empty training index: ${TRAIN_JSON}" >&2
+  exit 1
+fi
+
+EXTRA_ARGS=()
+if [ "${TRAIN_RULE_EMBEDDING}" = "1" ]; then
+  EXTRA_ARGS+=(--train-rule-embedding)
+fi
+if [ "${TRAIN_SAE}" = "1" ]; then
+  EXTRA_ARGS+=(--train-sae)
+fi
+if [ "${FREEZE_INTERNVL}" = "1" ]; then
+  EXTRA_ARGS+=(--freeze-internvl)
+fi
+if [ "${DEBUG_ROLLOUTS}" = "1" ]; then
+  EXTRA_ARGS+=(--debug-rollouts)
+fi
 
 "${PYTHON_BIN}" "scripts/train_vad_compass_internvl2_sht.py" \
   --project-root "." \
-  --data "${SMOKE_JSON}" \
+  --data "${TRAIN_JSON}" \
   --dataset-root "${DATASET_ROOT}" \
   --model-path "${MODEL_PATH}" \
   --output-dir "${OUTPUT_DIR}" \
   --train-split training \
   --epochs "${EPOCHS}" \
-  --max-samples "${SMOKE_SAMPLES}" \
+  --max-samples 0 \
   --max-steps "${MAX_STEPS}" \
   --sae-path "${SAE_PATH}" \
   --num-frames "${NUM_FRAMES}" \
@@ -138,7 +138,5 @@ fi
   --save-every "${SAVE_EVERY}" \
   --tensorboard-logdir "${TENSORBOARD_LOGDIR}" \
   --seed "${SEED}" \
-  "${TRAIN_SAE_ARGS[@]}" \
-  "${TRAIN_RULE_EMBEDDING_ARGS[@]}" \
-  "${FREEZE_INTERNVL_ARGS[@]}" \
+  "${EXTRA_ARGS[@]}" \
   "$@"
