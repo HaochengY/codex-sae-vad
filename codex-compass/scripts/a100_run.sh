@@ -79,18 +79,17 @@ if [ ! -s "${TRAIN_JSON}" ]; then
   exit 1
 fi
 
-EXTRA_ARGS=()
 if [ "${TRAIN_RULE_EMBEDDING}" = "1" ]; then
-  EXTRA_ARGS+=(--train-rule-embedding)
+  set -- --train-rule-embedding "$@"
 fi
 if [ "${TRAIN_SAE}" = "1" ]; then
-  EXTRA_ARGS+=(--train-sae)
+  set -- --train-sae "$@"
 fi
 if [ "${FREEZE_INTERNVL}" = "1" ]; then
-  EXTRA_ARGS+=(--freeze-internvl)
+  set -- --freeze-internvl "$@"
 fi
 if [ "${DEBUG_ROLLOUTS}" = "1" ]; then
-  EXTRA_ARGS+=(--debug-rollouts)
+  set -- --debug-rollouts "$@"
 fi
 
 "${PYTHON_BIN}" "scripts/train_vad_compass_internvl2_sht.py" \
@@ -138,5 +137,4 @@ fi
   --save-every "${SAVE_EVERY}" \
   --tensorboard-logdir "${TENSORBOARD_LOGDIR}" \
   --seed "${SEED}" \
-  "${EXTRA_ARGS[@]}" \
   "$@"
