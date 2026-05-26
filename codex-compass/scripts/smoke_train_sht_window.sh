@@ -9,10 +9,12 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 
 # Dataset layout expected under DATASET_ROOT:
 #   clips/train/*.mp4
+#   clips/test/*.mp4
 #   frame_labels/train/*.npy
+#   frame_labels/test/*.npy
 DATASET_ROOT="${DATASET_ROOT:-data/window3s_step1s_dataset}"
-CLIPS_SUBDIR="${CLIPS_SUBDIR:-clips/train}"
-LABELS_SUBDIR="${LABELS_SUBDIR:-frame_labels/train}"
+CLIPS_SUBDIRS="${CLIPS_SUBDIRS:-clips/train,clips/test}"
+LABELS_SUBDIRS="${LABELS_SUBDIRS:-frame_labels/train,frame_labels/test}"
 
 # Model directory. Keep this relative or pass MODEL_PATH from the shell.
 MODEL_PATH="${MODEL_PATH:-models/InternVL2}"
@@ -59,8 +61,8 @@ CLIPRANGE="${CLIPRANGE:-0.2}"
 
 "${PYTHON_BIN}" "scripts/prepare_sht_window_smoke_json.py" \
   --dataset-root "${DATASET_ROOT}" \
-  --clips-subdir "${CLIPS_SUBDIR}" \
-  --labels-subdir "${LABELS_SUBDIR}" \
+  --clips-subdirs "${CLIPS_SUBDIRS}" \
+  --labels-subdirs "${LABELS_SUBDIRS}" \
   --output-json "${SMOKE_JSON}" \
   --max-samples "${SMOKE_SAMPLES}" \
   --seed "${SEED}"
