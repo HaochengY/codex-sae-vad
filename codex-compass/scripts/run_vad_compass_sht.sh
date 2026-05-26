@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROJECT_ROOT="${PROJECT_ROOT:-/mnt/petrelfs/wangxiaoyang/yhc/codex-sae-vad/codex-compass}"
+PYTHON_BIN="${PYTHON_BIN:-/root/miniconda3/envs/mllm/bin/python}"
+PROJECT_ROOT="${PROJECT_ROOT:-/root/codex/codex-compass}"
 
-python "${PROJECT_ROOT}/scripts/train_vad_compass_internvl2_sht.py" \
+"${PYTHON_BIN}" "${PROJECT_ROOT}/scripts/train_vad_compass_internvl2_sht.py" \
   --project-root "${PROJECT_ROOT}" \
   --data "${DATA_JSON:-../data/sht_clip_32_160_conversations_filtered.json}" \
-  --dataset-root "${DATASET_ROOT:-/mnt/petrelfs/wangxiaoyang/yhc/dataset/sht/sht_clip_32_160}" \
-  --model-path "${MODEL_PATH:-/mnt/petrelfs/wangxiaoyang/yhc/get_data/InternVL2}" \
+  --dataset-root "${DATASET_ROOT:-../../autodl-tmp/sht_clip_32_160}" \
+  --model-path "${MODEL_PATH:-../../autodl-tmp/get_hf/InternVL2}" \
   --output-dir "${OUTPUT_DIR:-outputs/vad_compass_internvl2_sht}" \
   --train-split "${TRAIN_SPLIT:-all}" \
   --epochs "${EPOCHS:-1}" \

@@ -100,6 +100,12 @@ def build_arg_parser():
     parser.add_argument("--split", choices=["all", "training", "testing"], default="testing")
     parser.add_argument("--max-samples", type=int, default=0)
     parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--response-mode",
+        choices=["predicted", "neutral"],
+        default="predicted",
+        help="predicted: build POS-token response from the model's own first-pass prediction; neutral: fixed non-label answer placeholder.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dtype", choices=["bfloat16", "float16", "float32"], default=None)
     parser.add_argument("--num-frames", type=int, default=None)
@@ -107,6 +113,24 @@ def build_arg_parser():
     parser.add_argument("--max-patches-per-frame", type=int, default=None)
     parser.add_argument("--hook-layer", type=int, default=None)
     return parser
+
+
+def make_eval_response(action, prob, pos_token, k_slots, mode="predicted"):
+    if mode == "neutral":
+        pos_tokens = " ".join([pos_token] * int(k_slots))
+        return (
+            "<think> Evaluate the surveillance clip for abnormal activity using the visual evidence. </think>\n"
+            f"Here are the {int(k_slots)} anomaly concentration tokens:\n"
+            f"{pos_tokens}\n"
+            "Answer: normal"
+        )
+    return synthetic_response(
+        label=int(action),
+        action=int(action),
+        abnormal_prob=float(prob),
+        pos_token=pos_token,
+        k_slots=k_slots,
+    )
 
 
 @torch.no_grad()
@@ -185,7 +209,43 @@ def evaluate(args):
     for row in tqdm(rows, desc="Evaluating VAD-Compass"):
         try:
             y = label_to_int(row)
-            response = synthetic_response(y, y, 0.5, pos_token=pos_token, k_slots=k_slots)
+
+            # First pass: use a fixed non-label response only to obtain the POS-token
+            # anchors. This produces a model-side preliminary VAD decision without
+            # reading the ground-truth label.
+            neutral_response = make_eval_response(
+                action=0,
+                prob=0.5,
+                pos_token=pos_token,
+                k_slots=k_slots,
+                mode="neutral",
+            )
+            neutral_compass = extract_compass_hidden(
+                row,
+                model,
+                tokenizer,
+                torch_dtype,
+                hook_module,
+                final_hook_module,
+                question,
+                neutral_response,
+                pos_token_id,
+                run_args,
+            )
+            neutral_out = vad(neutral_compass["sae_tokens"], neutral_compass["pos_hidden"])
+            prelim_prob = float(neutral_out["video_prob"].detach().cpu().item())
+            predicted_action = int(prelim_prob >= args.threshold)
+
+            # Second pass: mirror SegCompass eval more closely by feeding a response
+            # that contains the model-side predicted answer plus POS tokens. GT is
+            # used only after this point to compute metrics.
+            response = make_eval_response(
+                action=predicted_action,
+                prob=prelim_prob,
+                pos_token=pos_token,
+                k_slots=k_slots,
+                mode=args.response_mode,
+            )
             compass = extract_compass_hidden(
                 row,
                 model,
@@ -206,6 +266,8 @@ def evaluate(args):
                     "id": row.get("id"),
                     "video_rel": row.get("video_rel"),
                     "label": y,
+                    "prelim_score_abnormal": prelim_prob,
+                    "response_mode": args.response_mode,
                     "score_abnormal": prob,
                     "pred": pred,
                     "correct": int(pred == y),
@@ -223,7 +285,17 @@ def evaluate(args):
             for rec in errors:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     with (out_dir / "predictions.csv").open("w", newline="", encoding="utf-8") as f:
-        fields = ["id", "video_rel", "label", "score_abnormal", "pred", "correct", "slot_probs"]
+        fields = [
+            "id",
+            "video_rel",
+            "label",
+            "prelim_score_abnormal",
+            "response_mode",
+            "score_abnormal",
+            "pred",
+            "correct",
+            "slot_probs",
+        ]
         writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
         writer.writerows(records)
