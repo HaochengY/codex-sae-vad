@@ -83,14 +83,14 @@ class QueryBookSlots(nn.Module):
         bsz = sparse_tokens.size(0)
         x = self.codebook(sparse_tokens)
         slots = self.slot_queries.expand(bsz, -1, -1)
-        x = torch.cat([slots, x], dim=1)
+        x = torch.cat([x, slots], dim=1)
         key_padding_mask = None
         if attention_mask is not None:
             valid = attention_mask.to(torch.bool)
             pad_slots = torch.zeros(bsz, self.k_slots, dtype=torch.bool, device=valid.device)
-            key_padding_mask = torch.cat([pad_slots, ~valid], dim=1)
+            key_padding_mask = torch.cat([~valid, pad_slots], dim=1)
         x = self.encoder(x, src_key_padding_mask=key_padding_mask)
-        return self.final_norm(x[:, : self.k_slots])
+        return self.final_norm(x[:, -self.k_slots :])
 
 
 class VadCompassHead(nn.Module):

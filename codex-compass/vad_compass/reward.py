@@ -5,7 +5,7 @@ import torch.nn.functional as F
 
 
 def format_score(response, pos_token="<ANOM_POS>", k_slots=4):
-    """SegCompass-style format score for VAD responses."""
+    """Format score for VAD responses with think text and rule tokens."""
     think_blocks = list(re.finditer(r"<think>(.*?)</think>", response, flags=re.DOTALL))
     if len(think_blocks) != 1:
         return 0.0
@@ -15,21 +15,21 @@ def format_score(response, pos_token="<ANOM_POS>", k_slots=4):
         return 0.0
     if response.count(pos_token) != int(k_slots):
         return 0.0
-    answers = re.findall(r"Answer:\s*(normal|abnormal)", response, flags=re.IGNORECASE)
-    if len(answers) != 1:
+    if re.search(r"\bAnswer\s*:", response, flags=re.IGNORECASE):
         return 0.0
-    answer_idx = response.lower().find("answer:")
-    if answer_idx < think.end():
+    marker = "Violated rules:"
+    marker_idx = response.find(marker)
+    if marker_idx < think.end():
         return 0.0
     last_pos_idx = response.rfind(pos_token)
-    if last_pos_idx < think.end() or answer_idx < last_pos_idx:
+    if last_pos_idx < marker_idx:
+        return 0.0
+    after_last = response[last_pos_idx + len(pos_token) :]
+    if re.search(r"\S", after_last):
         return 0.0
     long_think = len(content) > 2048
     has_non_ws_before = bool(re.search(r"\S", response[: think.start()]))
-    first_pos_idx = response.find(pos_token)
-    between = response[think.end() : first_pos_idx]
-    has_long_between = len(between.split()) > 10
-    return 0.9 if (long_think or has_non_ws_before or has_long_between) else 1.0
+    return 0.9 if (long_think or has_non_ws_before) else 1.0
 
 
 def answer_from_action(action):
@@ -44,9 +44,7 @@ def synthetic_response(label, action, abnormal_prob, pos_token="<ANOM_POS>", k_s
         "<think> The video-level evidence is evaluated from sparse visual "
         f"concept slots. The predicted class is {answer} with confidence {conf:.3f}. "
         "</think>\n"
-        f"Here are the {int(k_slots)} anomaly concentration tokens:\n"
-        f"{pos_tokens}\n"
-        f"Answer: {answer}"
+        f"Violated rules:{pos_tokens}"
     )
 
 

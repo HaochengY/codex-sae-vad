@@ -26,16 +26,24 @@ from vad_compass.reward import (
 
 
 DEFAULT_QUESTION = (
-    "Analyze this surveillance video clip for video-level anomaly detection.\n"
-    "Output the reasoning process in <think> </think>.\n"
-    "Then output exactly {K} anomaly concentration tokens, each written as {POS_TOKEN}.\n"
-    "These special tokens will be used to predict the video-level anomaly label.\n"
-    "Finally output exactly one final answer line: Answer: normal or Answer: abnormal.\n"
+    "You are a video anomaly detection assistant.\n\n"
+    "Known anomaly rule list:\n"
+    "1. Skateboarding is anomalous.\n"
+    "2. Riding a bicycle is anomalous.\n"
+    "3. Running is anomalous.\n"
+    "4. Fighting is anomalous.\n"
+    "5. Driving or riding a vehicle is anomalous.\n"
+    "6. Falling is anomalous.\n"
+    "7. Jumping is anomalous.\n\n"
+    "Determine whether this video clip contains any behavior that violates the rules above.\n\n"
+    "Requirements:\n"
+    "1. First, briefly explain the reasoning inside <think> </think>.\n"
+    "2. Then output `Violated rules:` followed by exactly {K} rule-focus tokens. "
+    "Each token must be written as {POS_TOKEN}.\n"
+    "3. Do not output Answer or any other extra text.\n\n"
     "Format:\n"
     "<think> your reasoning here </think>\n"
-    "Here are the {K} anomaly concentration tokens (K={K}):\n"
-    "{POS_TOKENS}\n"
-    "Answer: normal/abnormal"
+    "Violated rules:{POS_TOKENS}"
 )
 
 
@@ -87,7 +95,7 @@ def build_arg_parser():
     parser.add_argument("--model-path", default="../../autodl-tmp/get_hf/InternVL2")
     parser.add_argument("--output-dir", default="outputs/vad_compass_internvl2_sht")
     parser.add_argument("--question", default=DEFAULT_QUESTION)
-    parser.add_argument("--pos-token", default="<ANOM_POS>")
+    parser.add_argument("--pos-token", default="<RULE>")
     parser.add_argument("--hook-layer", type=int, default=12)
     parser.add_argument("--num-frames", type=int, default=8)
     parser.add_argument("--input-size", type=int, default=448)
@@ -116,6 +124,7 @@ def build_arg_parser():
     parser.add_argument("--dtype", choices=["bfloat16", "float16", "float32"], default="bfloat16")
     parser.add_argument("--log-every", type=int, default=1)
     parser.add_argument("--save-every", type=int, default=100)
+    parser.add_argument("--tensorboard-logdir", default="")
     parser.add_argument("--smoke", action="store_true")
     return parser
 
@@ -171,6 +180,16 @@ def train(args):
     opt = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=1e-2)
     metrics_path = output_dir / "metrics.jsonl"
     errors_path = output_dir / "errors.jsonl"
+    tb_writer = None
+    if args.tensorboard_logdir:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+
+            tb_logdir = resolve_path(args.tensorboard_logdir, project_root)
+            tb_logdir.mkdir(parents=True, exist_ok=True)
+            tb_writer = SummaryWriter(log_dir=str(tb_logdir))
+        except ModuleNotFoundError as exc:
+            print(f"TensorBoard logging disabled: {exc}")
 
     config = vars(args).copy()
     config.update(
@@ -185,7 +204,8 @@ def train(args):
             "pos_token": args.pos_token,
             "pos_token_id": pos_token_id,
             "label_counts": dict(label_counts),
-            "loss": "lambda_grpo*GRPO(format+answer reward) + lambda_bce*BCE(video_prob,label) + lambda_recon*SAE_MSE",
+            "loss": "lambda_grpo*GRPO(format+task reward) + lambda_bce*BCE(video_prob,label) + lambda_recon*SAE_MSE",
+            "tensorboard_logdir": str(resolve_path(args.tensorboard_logdir, project_root)) if args.tensorboard_logdir else "",
             "path_policy": "All CLI paths are resolved relative to --project-root unless absolute. JSON media paths are converted to paths relative to --dataset-root.",
         }
     )
@@ -331,6 +351,21 @@ def train(args):
                 }
                 if global_step % args.log_every == 0:
                     append_jsonl(metrics_path, rec)
+                    if tb_writer is not None:
+                        tb_writer.add_scalar("loss/total", rec["loss"], global_step)
+                        tb_writer.add_scalar("loss/bce", rec["bce_loss"], global_step)
+                        tb_writer.add_scalar("loss/grpo", rec["grpo_loss"], global_step)
+                        tb_writer.add_scalar("loss/recon", rec["recon_loss"], global_step)
+                        tb_writer.add_scalar("reward/mean", rec["reward_mean"], global_step)
+                        tb_writer.add_scalar("reward/format_score", rec["format_score_mean"], global_step)
+                        tb_writer.add_scalar("reward/task_score", rec["task_score_mean"], global_step)
+                        tb_writer.add_scalar("prediction/video_prob", rec["video_prob"], global_step)
+                        tb_writer.add_scalar("prediction/label", rec["label"], global_step)
+                        tb_writer.add_scalar("optimization/approx_kl", rec["approx_kl"], global_step)
+                        tb_writer.add_scalar("optimization/clipfrac", rec["clipfrac"], global_step)
+                        for slot_idx, slot_prob in enumerate(rec["slot_probs"]):
+                            tb_writer.add_scalar(f"slot_conf/slot_{slot_idx}", slot_prob, global_step)
+                        tb_writer.flush()
                     pbar.set_postfix(
                         p=round(rec["video_prob"], 3),
                         y=rec["label"],
@@ -371,6 +406,8 @@ def train(args):
         final_path,
     )
     print(json.dumps({"final": str(final_path), "steps": global_step}, ensure_ascii=False, indent=2))
+    if tb_writer is not None:
+        tb_writer.close()
     return final_path
 
 
