@@ -122,8 +122,6 @@ def build_arg_parser():
     parser.add_argument("--lr-decoder-rate", type=float, default=5.0)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
-    parser.add_argument("--train-sae", action="store_true")
-    parser.add_argument("--train-rule-embedding", action="store_true")
     parser.add_argument("--lambda-bce", type=float, default=1.0)
     parser.add_argument("--lambda-grpo", type=float, default=1.0)
     parser.add_argument("--lambda-recon", type=float, default=0.05)
@@ -145,7 +143,6 @@ def train(args):
     dataset_root = resolve_path(args.dataset_root, project_root)
     model_path = resolve_path(args.model_path, project_root)
     output_dir = resolve_path(args.output_dir, project_root)
-    sae_path = resolve_path(args.sae_path, project_root) if args.sae_path else None
     output_dir.mkdir(parents=True, exist_ok=True)
 
     random.seed(args.seed)
@@ -169,28 +166,12 @@ def train(args):
         model_path,
         dtype=args.dtype,
         special_tokens=[args.pos_token],
-        train_special_tokens=args.train_rule_embedding,
+        train_special_tokens=True,
     )
     pos_token_id = special_token_ids[args.pos_token]
     hook_name, hook_module = resolve_hook_module(model, args.hook_layer)
     _, final_hook_module = resolve_hook_module(model, model.config.llm_config.num_hidden_layers - 1)
     d_in = model.config.llm_config.hidden_size
-    sae_checkpoint = None
-    if sae_path:
-        layer_match = re.search(r"sae_l(\d+)", str(sae_path))
-        if layer_match and int(layer_match.group(1)) != int(args.hook_layer):
-            raise ValueError(
-                f"SAE path layer sae_l{layer_match.group(1)} does not match --hook-layer {args.hook_layer}: {sae_path}"
-            )
-        sae_checkpoint = torch.load(sae_path, map_location="cpu")
-        ckpt_d_in = int(sae_checkpoint.get("d_in", d_in)) if isinstance(sae_checkpoint, dict) else d_in
-        if ckpt_d_in != int(d_in):
-            raise ValueError(f"SAE d_in {ckpt_d_in} does not match model hidden size {d_in}: {sae_path}")
-        if not args.num_latents and isinstance(sae_checkpoint, dict) and sae_checkpoint.get("num_latents"):
-            args.num_latents = int(sae_checkpoint["num_latents"])
-        ckpt_args = sae_checkpoint.get("args", {}) if isinstance(sae_checkpoint, dict) else {}
-        if args.sae_topk == 0 and ckpt_args.get("k"):
-            args.sae_topk = int(ckpt_args["k"])
     num_latents = args.num_latents or d_in * args.expansion_factor
     vad = VadCompassHead(
         d_in=d_in,
@@ -201,10 +182,15 @@ def train(args):
         nhead=args.slot_heads,
         num_layers=args.slot_layers,
     ).cuda()
+    sae_path = resolve_path(args.sae_path, project_root) if args.sae_path else None
     if sae_path:
-        checkpoint = sae_checkpoint
+        layer_match = re.search(r"sae_l(\d+)", str(sae_path))
+        if layer_match and int(layer_match.group(1)) != int(args.hook_layer):
+            raise ValueError(
+                f"SAE path layer sae_l{layer_match.group(1)} does not match --hook-layer {args.hook_layer}: {sae_path}"
+            )
+        checkpoint = torch.load(sae_path, map_location="cpu")
         state = checkpoint.get("state_dict", checkpoint.get("model", checkpoint))
-        state = checkpoint.get("sae", state)
         sae_state = {}
         for key, value in state.items():
             if key.startswith("sae."):
@@ -217,9 +203,6 @@ def train(args):
         if unexpected:
             raise ValueError(f"unexpected SAE keys from {sae_path}: {unexpected}")
         print(f"loaded SAE from {sae_path} missing={missing}")
-    if not args.train_sae:
-        for p in vad.sae.parameters():
-            p.requires_grad_(False)
     emb_params = [p for p in model.language_model.get_input_embeddings().parameters() if p.requires_grad]
     param_groups = []
 
@@ -231,8 +214,7 @@ def train(args):
     add_group("query_book", vad.query_book.parameters(), args.lr * args.lr_qb_rate)
     add_group("head", list(vad.query_fuse.parameters()) + list(vad.conf_head.parameters()), args.lr * args.lr_head_rate)
     add_group("pe", list(vad.pos_proj.parameters()) + emb_params, args.lr * args.lr_pe_rate)
-    if args.train_sae:
-        add_group("sae", vad.sae.parameters(), args.lr * args.lr_decoder_rate)
+    add_group("sae", vad.sae.parameters(), args.lr * args.lr_decoder_rate)
     opt = torch.optim.AdamW(param_groups, lr=args.lr, weight_decay=args.weight_decay)
     metrics_path = output_dir / "metrics.jsonl"
     errors_path = output_dir / "errors.jsonl"
@@ -265,7 +247,7 @@ def train(args):
             "pos_token": args.pos_token,
             "pos_token_id": pos_token_id,
             "label_counts": dict(label_counts),
-            "loss": "lambda_grpo*GRPO(format+task reward) + lambda_bce*BCE(video_prob,label); SAE_MSE is added only when --train-sae is set",
+            "loss": "lambda_grpo*GRPO(format+task reward) + lambda_bce*BCE(video_prob,label) + lambda_recon*SAE_MSE",
             "tensorboard_logdir": str(resolve_path(args.tensorboard_logdir, project_root)) if args.tensorboard_logdir else "",
             "path_policy": "All CLI paths are resolved relative to --project-root unless absolute. JSON media paths are converted to paths relative to --dataset-root.",
         }
@@ -379,16 +361,14 @@ def train(args):
                 loss = (
                     args.lambda_grpo * grpo_loss
                     + args.lambda_bce * bce_loss
-                    + (args.lambda_recon * recon_loss if args.train_sae else 0.0)
+                    + args.lambda_recon * recon_loss
                 )
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
-                if args.train_sae:
-                    vad.sae.remove_decoder_parallel_grad()
+                vad.sae.remove_decoder_parallel_grad()
                 torch.nn.utils.clip_grad_norm_(vad.parameters(), args.max_grad_norm)
                 opt.step()
-                if args.train_sae:
-                    vad.sae.normalize_decoder()
+                vad.sae.normalize_decoder()
 
                 pred = int(prob_value >= 0.5)
                 rec = {

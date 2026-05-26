@@ -42,14 +42,14 @@ DTYPE="${DTYPE:-bfloat16}"
 # VAD-Compass controls.
 K_SLOTS="${K_SLOTS:-4}"
 POS_TOKEN="${POS_TOKEN:-<RULE>}"
-SAE_ROOT="${SAE_ROOT:-/root/codex/outputs/temporal_m_sae_internvl_sht_clips10k_filtered_8f_16x_k256_1ep}"
-SAE_PATH="${SAE_PATH:-${SAE_ROOT}/sae_final.pt}"
+SAE_ROOT="${SAE_ROOT:-/mnt/petrelfs/wangxiaoyang/yhc/codex-sae-vad/outputs}"
+SAE_PATH="${SAE_PATH:-${SAE_ROOT}/sae_l${HOOK_LAYER}/sae_final.pt}"
 EXPANSION_FACTOR="${EXPANSION_FACTOR:-16}"
-NUM_LATENTS="${NUM_LATENTS:-0}"
-SAE_TOPK="${SAE_TOPK:-0}"
-SLOT_DIM="${SLOT_DIM:-512}"
-SLOT_HEADS="${SLOT_HEADS:-8}"
-SLOT_LAYERS="${SLOT_LAYERS:-2}"
+NUM_LATENTS="${NUM_LATENTS:-1024}"
+SAE_TOPK="${SAE_TOPK:-32}"
+SLOT_DIM="${SLOT_DIM:-128}"
+SLOT_HEADS="${SLOT_HEADS:-4}"
+SLOT_LAYERS="${SLOT_LAYERS:-1}"
 
 # Optimization and reward controls.
 LR="${LR:-1.6e-6}"
@@ -59,8 +59,6 @@ LR_PE_RATE="${LR_PE_RATE:-10}"
 LR_DECODER_RATE="${LR_DECODER_RATE:-5}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-1e-2}"
 MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
-TRAIN_SAE="${TRAIN_SAE:-0}"
-TRAIN_RULE_EMBEDDING="${TRAIN_RULE_EMBEDDING:-0}"
 ROLLOUT_N="${ROLLOUT_N:-4}"
 LAMBDA_GRPO="${LAMBDA_GRPO:-1.0}"
 LAMBDA_BCE="${LAMBDA_BCE:-1.0}"
@@ -68,14 +66,6 @@ LAMBDA_RECON="${LAMBDA_RECON:-0.05}"
 FORMAT_WEIGHT="${FORMAT_WEIGHT:-0.3}"
 TASK_WEIGHT="${TASK_WEIGHT:-0.7}"
 CLIPRANGE="${CLIPRANGE:-0.2}"
-TRAIN_SAE_ARGS=()
-if [ "${TRAIN_SAE}" = "1" ]; then
-  TRAIN_SAE_ARGS+=(--train-sae)
-fi
-TRAIN_RULE_EMBEDDING_ARGS=()
-if [ "${TRAIN_RULE_EMBEDDING}" = "1" ]; then
-  TRAIN_RULE_EMBEDDING_ARGS+=(--train-rule-embedding)
-fi
 
 "${PYTHON_BIN}" "scripts/prepare_sht_window_smoke_json.py" \
   --dataset-root "${DATASET_ROOT}" \
@@ -127,6 +117,4 @@ fi
   --save-every "${SAVE_EVERY}" \
   --tensorboard-logdir "${TENSORBOARD_LOGDIR}" \
   --seed "${SEED}" \
-  "${TRAIN_SAE_ARGS[@]}" \
-  "${TRAIN_RULE_EMBEDDING_ARGS[@]}" \
   "$@"
