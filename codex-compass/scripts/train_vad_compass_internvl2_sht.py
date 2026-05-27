@@ -17,8 +17,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from vad_compass.internvl_utils import (
     build_internvl,
     extract_compass_hidden,
+    generate_qwen_rollout_responses,
     load_video_as_pixel_values,
     resolve_hook_module,
+    text_hidden_size,
+    text_num_hidden_layers,
 )
 from vad_compass.modeling import VadCompassHead
 from vad_compass.path_utils import load_json_rows, portable_rows, resolve_path
@@ -118,6 +121,8 @@ def vad_response_reward(label, response, video_prob, format_weight=0.3, task_wei
 
 @torch.no_grad()
 def generate_rollout_responses(row, model, tokenizer, dtype, question, args):
+    if getattr(model, "is_qwen_vl", False):
+        return generate_qwen_rollout_responses(row, model, dtype, question, args)
     pixel_values, num_patches_list = load_video_as_pixel_values(
         row["video"],
         num_frames=args.num_frames,
@@ -260,8 +265,8 @@ def train(args):
         model.train()
     pos_token_id = special_token_ids[args.pos_token]
     hook_name, hook_module = resolve_hook_module(model, args.hook_layer)
-    _, final_hook_module = resolve_hook_module(model, model.config.llm_config.num_hidden_layers - 1)
-    d_in = model.config.llm_config.hidden_size
+    _, final_hook_module = resolve_hook_module(model, text_num_hidden_layers(model) - 1)
+    d_in = text_hidden_size(model)
     sae_checkpoint = None
     if sae_path:
         layer_match = re.search(r"sae_l(\d+)", str(sae_path))
@@ -352,6 +357,7 @@ def train(args):
             "pos_token": args.pos_token,
             "pos_token_id": pos_token_id,
             "internvl_trainable": not args.freeze_internvl,
+            "backbone_family": "qwen2_5_vl" if getattr(model, "is_qwen_vl", False) else "internvl",
             "label_counts": dict(label_counts),
             "loss": "lambda_grpo*GRPO(generated response reward) + lambda_bce*BCE(video_prob,label); SAE_MSE is added only when --train-sae is set",
             "tensorboard_logdir": str(resolve_path(args.tensorboard_logdir, project_root)) if args.tensorboard_logdir else "",
@@ -560,6 +566,8 @@ def train(args):
         internvl_dir.mkdir(parents=True, exist_ok=True)
         model.save_pretrained(str(internvl_dir))
         tokenizer.save_pretrained(str(internvl_dir))
+        if getattr(model, "is_qwen_vl", False):
+            model.processor.save_pretrained(str(internvl_dir))
         internvl_final = str(internvl_dir)
     print(json.dumps({"final": str(final_path), "internvl_final": internvl_final, "steps": global_step}, ensure_ascii=False, indent=2))
     if tb_writer is not None:

@@ -1,14 +1,16 @@
 import importlib
+import json
 import sys
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn as nn
 import torchvision.transforms as T
 from decord import VideoReader, cpu
 from PIL import Image
 from torchvision.transforms.functional import InterpolationMode
-from transformers import AutoTokenizer
+from transformers import AutoProcessor, AutoTokenizer
 
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
@@ -97,8 +99,97 @@ def load_video_as_pixel_values(video_path, num_frames=8, input_size=448, max_num
     return torch.cat(pixel_values, dim=0), num_patches_list
 
 
+def _model_type(model_path):
+    config_path = Path(model_path) / "config.json"
+    if not config_path.exists():
+        return ""
+    with config_path.open("r", encoding="utf-8") as f:
+        return str(json.load(f).get("model_type", "")).lower()
+
+
+def _torch_dtype(dtype):
+    return {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }[dtype]
+
+
+def _move_batch_to_cuda(batch):
+    return {k: (v.cuda() if torch.is_tensor(v) else v) for k, v in batch.items()}
+
+
+class Qwen25VLAdapter(nn.Module):
+    def __init__(self, model, processor, tokenizer):
+        super().__init__()
+        self.model = model
+        self.processor = processor
+        self.tokenizer = tokenizer
+        self.config = model.config
+        self.is_qwen_vl = True
+
+    def forward(self, *args, **kwargs):
+        return self.model(*args, **kwargs)
+
+    def generate(self, *args, **kwargs):
+        return self.model.generate(*args, **kwargs)
+
+    def get_submodule(self, target):
+        return self.model.get_submodule(target)
+
+    def save_pretrained(self, *args, **kwargs):
+        return self.model.save_pretrained(*args, **kwargs)
+
+
+def _build_qwen25_vl(model_path, dtype="bfloat16", special_tokens=None, train_special_tokens=False):
+    try:
+        from transformers import Qwen2_5_VLForConditionalGeneration
+    except ImportError as exc:
+        raise ImportError(
+            "Qwen2.5-VL requires a newer transformers build. Install a Qwen2.5-VL-capable "
+            "version, for example: pip install -U transformers>=4.49.0 qwen-vl-utils"
+        ) from exc
+
+    torch_dtype = _torch_dtype(dtype)
+    tokenizer = AutoTokenizer.from_pretrained(
+        str(model_path), trust_remote_code=True, use_fast=False
+    )
+    processor = AutoProcessor.from_pretrained(str(model_path), trust_remote_code=True)
+    model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+        str(model_path),
+        torch_dtype=torch_dtype,
+        low_cpu_mem_usage=True,
+        trust_remote_code=True,
+    ).eval().cuda()
+    special_token_ids = {}
+    if special_tokens:
+        added = tokenizer.add_tokens(list(special_tokens), special_tokens=True)
+        if added > 0:
+            model.resize_token_embeddings(len(tokenizer))
+        for token in special_tokens:
+            special_token_ids[token] = int(tokenizer.convert_tokens_to_ids(token))
+    if hasattr(processor, "tokenizer"):
+        processor.tokenizer = tokenizer
+    for p in model.parameters():
+        p.requires_grad_(False)
+    if train_special_tokens and special_tokens:
+        emb = model.get_input_embeddings()
+        emb.weight.requires_grad_(True)
+        emb.weight.register_hook(
+            lambda grad: _mask_embedding_grad(grad, list(special_token_ids.values()))
+        )
+    return Qwen25VLAdapter(model, processor, tokenizer), tokenizer, torch_dtype, special_token_ids
+
+
 def build_internvl(model_path, dtype="bfloat16", special_tokens=None, train_special_tokens=False):
     model_path = Path(model_path).resolve()
+    if _model_type(model_path) == "qwen2_5_vl":
+        return _build_qwen25_vl(
+            model_path,
+            dtype=dtype,
+            special_tokens=special_tokens,
+            train_special_tokens=train_special_tokens,
+        )
     (model_path / "__init__.py").touch(exist_ok=True)
     sys.path.insert(0, str(model_path.parent))
     module = importlib.import_module(f"{model_path.name}.modeling_internvl_chat")
@@ -108,11 +199,7 @@ def build_internvl(model_path, dtype="bfloat16", special_tokens=None, train_spec
     tokenizer = AutoTokenizer.from_pretrained(
         str(model_path), trust_remote_code=True, use_fast=False
     )
-    torch_dtype = {
-        "bfloat16": torch.bfloat16,
-        "float16": torch.float16,
-        "float32": torch.float32,
-    }[dtype]
+    torch_dtype = _torch_dtype(dtype)
     model = cls.from_pretrained(
         str(model_path),
         torch_dtype=torch_dtype,
@@ -163,11 +250,141 @@ def build_prompt(model, tokenizer, question, num_patches_list, assistant_respons
 
 
 def resolve_hook_module(model, hook_layer):
+    if getattr(model, "is_qwen_vl", False):
+        name = f"model.language_model.layers.{hook_layer}"
+        return name, model.get_submodule(name)
     name = f"language_model.model.layers.{hook_layer}"
     return name, model.get_submodule(name)
 
 
+def text_num_hidden_layers(model):
+    llm_cfg = getattr(model.config, "llm_config", None)
+    if llm_cfg is not None:
+        return int(llm_cfg.num_hidden_layers)
+    text_cfg = getattr(model.config, "text_config", None)
+    if text_cfg is not None:
+        return int(text_cfg.num_hidden_layers)
+    return int(model.config.num_hidden_layers)
+
+
+def text_hidden_size(model):
+    llm_cfg = getattr(model.config, "llm_config", None)
+    if llm_cfg is not None:
+        return int(llm_cfg.hidden_size)
+    text_cfg = getattr(model.config, "text_config", None)
+    if text_cfg is not None:
+        return int(text_cfg.hidden_size)
+    return int(model.config.hidden_size)
+
+
+def _qwen_messages(frames, question, assistant_response=None):
+    content = [{"type": "image", "image": frame} for frame in frames]
+    content.append({"type": "text", "text": question.strip()})
+    messages = [{"role": "user", "content": content}]
+    if assistant_response is not None:
+        messages.append({"role": "assistant", "content": assistant_response})
+    return messages
+
+
+def _qwen_inputs(model, frames, question, assistant_response=None, add_generation_prompt=False):
+    messages = _qwen_messages(frames, question, assistant_response=assistant_response)
+    text = model.processor.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=add_generation_prompt,
+    )
+    batch = model.processor(
+        text=[text],
+        images=frames,
+        padding=True,
+        return_tensors="pt",
+    )
+    return _move_batch_to_cuda(batch), text
+
+
+@torch.no_grad()
+def generate_qwen_rollout_responses(row, model, dtype, question, args):
+    frames = sample_video_frames(row["video"], args.num_frames)
+    inputs, _ = _qwen_inputs(model, frames, question, add_generation_prompt=True)
+    generation_kwargs = {
+        "max_new_tokens": args.max_new_tokens,
+        "do_sample": True,
+        "temperature": args.temperature,
+        "top_p": args.top_p,
+    }
+    was_training = model.training
+    model.eval()
+    responses = []
+    for _ in range(args.rollout_n):
+        generated = model.generate(**inputs, **generation_kwargs)
+        new_ids = generated[:, inputs["input_ids"].shape[1] :]
+        response = model.tokenizer.batch_decode(new_ids, skip_special_tokens=True)[0]
+        responses.append(response.strip())
+    if was_training:
+        model.train()
+    return responses
+
+
+def extract_qwen_compass_hidden(row, model, dtype, sae_hook_module, final_hook_module, question, response, pos_token_id, args):
+    frames = sample_video_frames(row["video"], args.num_frames)
+    inputs, prompt = _qwen_inputs(model, frames, question, assistant_response=response)
+    buffers = {}
+
+    def sae_hook(_, __, output):
+        if isinstance(output, tuple):
+            output = output[0]
+        buffers["sae_hidden"] = output
+
+    def final_hook(_, __, output):
+        if isinstance(output, tuple):
+            output = output[0]
+        buffers["final_hidden"] = output
+
+    sae_handle = sae_hook_module.register_forward_hook(sae_hook)
+    final_handle = final_hook_module.register_forward_hook(final_hook)
+    try:
+        out = model(**inputs, use_cache=False)
+    finally:
+        sae_handle.remove()
+        final_handle.remove()
+
+    input_ids = inputs["input_ids"]
+    attention_mask = inputs.get("attention_mask", torch.ones_like(input_ids))
+    valid = attention_mask[0].bool()
+    sae_h = buffers["sae_hidden"][0][valid].float()
+    final_h = buffers["final_hidden"][0][valid].float()
+    ids = input_ids[0][valid]
+    sae_h = torch.nan_to_num(sae_h, nan=0.0, posinf=0.0, neginf=0.0)
+    final_h = torch.nan_to_num(final_h, nan=0.0, posinf=0.0, neginf=0.0)
+    image_token_id = int(getattr(model.config, "image_token_id", model.tokenizer.convert_tokens_to_ids("<|image_pad|>")))
+    image_positions = (ids == image_token_id).nonzero(as_tuple=False).flatten()
+    pos = (ids == int(pos_token_id)).nonzero(as_tuple=False).flatten()
+    if pos.numel() < args.k_slots:
+        raise ValueError(f"expected at least {args.k_slots} POS tokens, got {int(pos.numel())}")
+    pos = pos[-args.k_slots :]
+    return {
+        "sae_tokens": sae_h,
+        "image_grid": final_h[image_positions],
+        "pos_hidden": final_h[pos],
+        "input_ids": ids,
+        "prompt": prompt,
+        "model_output": out,
+    }
+
+
 def extract_compass_hidden(row, model, tokenizer, dtype, sae_hook_module, final_hook_module, question, response, pos_token_id, args):
+    if getattr(model, "is_qwen_vl", False):
+        return extract_qwen_compass_hidden(
+            row,
+            model,
+            dtype,
+            sae_hook_module,
+            final_hook_module,
+            question,
+            response,
+            pos_token_id,
+            args,
+        )
     pixel_values, num_patches_list = load_video_as_pixel_values(
         row["video"],
         num_frames=args.num_frames,
